@@ -1,0 +1,304 @@
+# GitHub Actions CI/CD Pipeline
+
+name: FinLedger CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ===========================================================================
+  # TEST JOB
+  # ===========================================================================
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: finledger_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip install -e .
+      
+      - name: Run database migrations
+        run: alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/finledger_test
+      
+      - name: Run tests
+        run: |
+          pytest --cov=finledger --cov-report=xml --cov-report=term-missing --cov-fail-under=80
+        env:
+          DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/finledger_test
+          REDIS_URL: redis://localhost:6379/1
+          JWT_PRIVATE_KEY_PATH: ./keys/jwt_private.pem
+          JWT_PUBLIC_KEY_PATH: ./keys/jwt_public.pem
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-${{ matrix.python-version }}
+  
+  # ===========================================================================
+  # CODE QUALITY JOB
+  # ===========================================================================
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      
+      - name: Run Ruff (linting)
+        run: ruff check .
+      
+      - name: Run Ruff (formatting check)
+        run: ruff format --check .
+      
+      - name: Run MyPy (type checking)
+        run: mypy src/
+      
+      - name: Run Bandit (security)
+        run: bandit -r src/ -f json -o bandit-report.json || true
+      
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  # ===========================================================================
+  # SECURITY SCAN JOB
+  # ===========================================================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+  
+  # ===========================================================================
+  # BUILD JOB
+  # ===========================================================================
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [test, lint, security]
+    if: github.event_name == 'push'
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      digest: ${{ steps.image.outputs.digest }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ github.sha }},enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=FinLedger
+            org.opencontainers.image.description=Production-grade digital wallet and transaction platform
+            org.opencontainers.image.version=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+      
+      - name: Build and push
+        id: image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+  
+  # ===========================================================================
+  # DEPLOY STAGING JOB
+  # ===========================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG_STAGING }}
+      
+      - name: Deploy to Staging
+        run: |
+          kubectl set image deployment/finledger-api \
+            api=${{ needs.build.outputs.image }} \
+            -n finledger-staging
+          kubectl rollout status deployment/finledger-api \
+            -n finledger-staging --timeout=300s
+      
+      - name: Run smoke tests
+        run: |
+          sleep 10  # Wait for pods to be ready
+          curl -f https://staging-api.finledger.io/health/ready
+          curl -f https://staging-api.finledger.io/health/live
+  
+  # ===========================================================================
+  # DEPLOY PRODUCTION JOB
+  # ===========================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ secrets.KUBECONFIG_PRODUCTION }}
+      
+      - name: Deploy to Production (Blue-Green via ArgoCD)
+        run: |
+          # Update ArgoCD application image
+          kubectl patch application finledger-api \
+            -n argocd \
+            -p '{"spec":{"source":{"targetRevision":"'${{ github.sha }}'"}}}' \
+            --type=merge
+          
+          # Wait for sync
+          kubectl wait --for=condition=Synced application/finledger-api -n argocd --timeout=600s
+          
+          # Verify rollout
+          kubectl rollout status deployment/finledger-api \
+            -n finledger --timeout=600s
+      
+      - name: Run production smoke tests
+        run: |
+          sleep 15  # Wait for pods to be ready
+          curl -f https://api.finledger.io/health/ready
+          curl -f https://api.finledger.io/health/live
+          curl -f https://api.finledger.io/api/v1/health
+      
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "✅ Production deployment successful!"
+          # Add Slack/Discord notification here
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Production deployment failed!"
+          # Add Slack/Discord notification here
